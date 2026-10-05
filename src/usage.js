@@ -13,8 +13,9 @@
  *     多展品操作失败时事务回滚、占用结果与预警事件一并回滚；
  *   - 单次变更只读取受影响年份区间内的历史记录，不扫描无关年份的全部历史。
  *
- * 派生结果（annual_usage）可由 scripts/rebuild-usage.js 对既有数据全量重建：
- * 重建按展品逐个在事务内进行，任何错误都会抛出并回滚，绝不留下新旧占用混杂的状态。
+ * 派生结果（annual_usage）可由 scripts/rebuild-usage.js / HTTP 维护接口 / 启动补齐
+ * 对既有数据全量重建：一次操作选中的全部展品在**同一个事务**内原子重建
+ * （见 rebuildExhibitsUsageAtomic），任何错误都会整体回滚，绝不留下新旧占用混杂的状态。
  */
 
 const { computeOccupancy, yearsToRanges } = require('./service');
@@ -244,11 +245,42 @@ async function rebuildExhibitUsage(client, exhibitId) {
   return { exhibitId, years };
 }
 
+/**
+ * 一次操作原子重建多件展品的派生占用（HTTP 维护接口 / 命令行脚本 / 启动补齐共用）。
+ * 全部选中展品在**同一个事务**内处理：按展品 id 升序依次取得应用层键锁与展品行锁
+ * （与日常占用变更的展品锁互斥串行，不会与审批/实测等写入相互覆盖），再逐展品全量重建；
+ * 任一展品任一年份失败，整个事务回滚——所有选中展品的 annual_usage 与预警阈值最近状态
+ * （last_used_lxh / last_level）均保持操作前的值，也不补发任何预警事件。
+ * 错误信息会带上展品编号，便于定位后修复重试。返回 [{ exhibitId, years }…]（按 id 升序）。
+ */
+async function rebuildExhibitsUsageAtomic(exhibitIds) {
+  const { withExhibitsTransaction } = require('./db');
+  const ids = [...new Set((exhibitIds || []).map(Number))]
+    .filter((id) => Number.isInteger(id) && id > 0)
+    .sort((a, b) => a - b);
+  return withExhibitsTransaction(ids, async (client) => {
+    const rebuilt = [];
+    for (const exhibitId of ids) {
+      try {
+        rebuilt.push(await rebuildExhibitUsage(client, exhibitId));
+      } catch (err) {
+        const prefix = `展品 #${exhibitId}`;
+        if (!String(err && err.message).startsWith(prefix)) {
+          err.message = `${prefix} 重建失败：${err.message}`;
+        }
+        throw err;
+      }
+    }
+    return rebuilt;
+  });
+}
+
 module.exports = {
   yearsToRanges,
   refreshUsageYears,
   recomputeExhibitUsage,
   rebuildExhibitUsage,
+  rebuildExhibitsUsageAtomic,
   getUsageRow,
   getUsageRows,
   yearsForRebuild,

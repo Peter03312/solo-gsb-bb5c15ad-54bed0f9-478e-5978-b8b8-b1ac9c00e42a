@@ -3,11 +3,11 @@
 const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
-const { pool, withTransaction } = require('./db');
+const { pool } = require('./db');
 const config = require('./config');
 const { buildWindows, doseByYear, yearMapToObject } = require('./dosing');
 const { parsePeriods } = require('./validation');
-const { rebuildExhibitUsage } = require('./usage');
+const { rebuildExhibitsUsageAtomic } = require('./usage');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -94,8 +94,9 @@ async function ensureDemo(conservatorId) {
  * 启动时补齐派生占用表 annual_usage：
  *  - 全新空库：无展品，直接跳过；
  *  - 全新带演示数据 / 从旧版本升级（annual_usage 尚无行但已有展品/上限/计划等源数据）：
- *    逐展品在事务内按统一剂量口径全量重建一次，任一年份不一致即抛错中止启动，
- *    绝不带着新旧占用混杂的派生结果对外服务。
+ *    全部展品在**同一个事务**内按统一剂量口径原子重建一次，任一展品任一年份失败即
+ *    整体回滚并中止启动（annual_usage 仍为空，下次启动会再次尝试；Docker Compose 的
+ *    restart: unless-stopped 会自动重启重试），绝不带着新旧占用混杂的派生结果对外服务。
  * 已在运行中维护的库（annual_usage 非空）不在启动时重复扫描全部历史。
  */
 async function backfillDerivedUsage() {
@@ -104,11 +105,9 @@ async function backfillDerivedUsage() {
   const { rows: exhibitRows } = await pool.query('SELECT id FROM exhibits ORDER BY id');
   if (exhibitRows.length === 0) return;
 
-  console.log(`[init] annual_usage 为空，开始从既有数据重建 ${exhibitRows.length} 件展品的年度占用…`);
-  for (const r of exhibitRows) {
-    const exhibitId = Number(r.id);
-    await withTransaction((client) => rebuildExhibitUsage(client, exhibitId));
-  }
+  const exhibitIds = exhibitRows.map((r) => Number(r.id));
+  console.log(`[init] annual_usage 为空，开始从既有数据原子重建 ${exhibitIds.length} 件展品的年度占用…`);
+  await rebuildExhibitsUsageAtomic(exhibitIds);
   console.log('[init] annual_usage 重建完成');
 }
 

@@ -15,7 +15,9 @@
  *                 自然年重算、纠错超额转待复核、占用下降不恢复待复核、链式纠错、取消计划后纠错）、
  *       计划外照明事故（登记校验/三类相交冲突一次性指出且不保存、窗内替代估算/窗外单独计量/不释放排期、
  *                 跨年拆分、后续实测/停灯/纠错互斥、超额仍生效转待复核、已开始计划不转、
- *                 下调预演指纹含事故、已封存账册不回写与新增来源对照、调整口径、不可改删/越权）。
+ *                 下调预演指纹含事故、已封存账册不回写与新增来源对照、调整口径、不可改删/越权）、
+ *       年度占用局部重算与派生重建（相接实测不合并、失败回滚、多展品重建原子性：
+ *                 任一展品失败时全部选中展品的派生占用与预警最近状态保持操作前值、不补发事件、可重试）。
  */
 
 process.env.SEED_DEMO = 'false';
@@ -3601,6 +3603,114 @@ async function runFlow() {
     assert(rr.status === 400, '重建未知展品返回 400');
     rr = await call('POST', '/api/maintenance/rebuild-usage', { exhibitIds: [exU] }, 'c');
     assert(rr.status === 200 && rr.body.exhibitCount === 1, '按展品重建');
+
+    // ---- 多展品重建原子性：任一展品失败，全部选中展品的派生占用与预警最近状态保持操作前值 ----
+    {
+      const exR1 = await createExhibit('重建原子性展品一');
+      const exR2 = await createExhibit('重建原子性展品二');
+      await call('POST', `/api/exhibits/${exR1}/limits`, { year: 2033, limitLxh: 5000 }, 'c');
+      await call('POST', `/api/exhibits/${exR2}/limits`, { year: 2033, limitLxh: 5000 }, 'c');
+      const pR1 = await submitPlan(exR1, '重建计划一', '2033-03-01', '2033-03-01',
+        ['09:00-17:00'], 100); // 800
+      const pR2 = await submitPlan(exR2, '重建计划二', '2033-04-01', '2033-04-01',
+        ['09:00-12:00'], 100); // 300
+      await approvePlan(pR1);
+      await approvePlan(pR2);
+      // 两展品均设置分级预警阈值（以当时占用重建基线：800/5000=16% → low）
+      rr = await call('POST', `/api/exhibits/${exR1}/quota-thresholds`,
+        { year: 2033, lowPct: 10, highPct: 90 }, 'c');
+      assert(rr.status === 200, '展品一设置阈值');
+      rr = await call('POST', `/api/exhibits/${exR2}/quota-thresholds`,
+        { year: 2033, lowPct: 10, highPct: 90 }, 'c');
+      assert(rr.status === 200, '展品二设置阈值');
+
+      const usageOf = (exId) => q(
+        'SELECT year, used_lxh FROM annual_usage WHERE exhibit_id = $1 ORDER BY year', [exId]);
+      const thresholdOf = (exId) => q(
+        'SELECT year, last_used_lxh, last_level FROM annual_quota_thresholds WHERE exhibit_id = $1 ORDER BY year',
+        [exId]);
+      const alertCount = async () => Number((await q(
+        'SELECT COUNT(*)::int AS n FROM annual_quota_alerts WHERE exhibit_id IN ($1, $2)',
+        [exR1, exR2]))[0].n);
+
+      const r2UsageBefore = await usageOf(exR2);
+      assert(r2UsageBefore.some((r) => r.year === 2033 && Number(r.used_lxh) === 300),
+        '展品二 2033 派生占用 300');
+      // 人为破坏展品一的派生状态（模拟与源数据不一致的“操作前值”）：
+      // 若重建非原子，展品一会被先行重建并提交，这些值就会被改回
+      await dbModule.pool.query('DELETE FROM annual_usage WHERE exhibit_id = $1', [exR1]);
+      await dbModule.pool.query(
+        `UPDATE annual_quota_thresholds SET last_used_lxh = 0, last_level = 'none'
+          WHERE exhibit_id = $1`, [exR1]);
+      const alertsBefore = await alertCount();
+
+      // 给展品二直接写入一条开灯时段互相重叠的已批准计划（绕过接口校验），使其重建必然失败
+      await dbModule.pool.query(
+        `INSERT INTO plans (exhibit_id, title, start_date, end_date, light_periods, estimated_lux, status)
+         VALUES ($1, '损坏计划', '2033-05-01', '2033-05-01',
+                 '["09:00-12:00","10:00-13:00"]'::jsonb, 100, 'approved')`,
+        [exR2]);
+
+      // pg-mem 的 pg 适配器不实现事务回滚（BEGIN/ROLLBACK 为 no-op），为验证
+      // “任一展品失败、全部选中展品保持操作前值”的真实回滚语义（生产 PostgreSQL 行为），
+      // 仅在本块临时为连接加上 backup/restore 回滚能力。
+      const origConnect = dbModule.pool.connect;
+      dbModule.pool.connect = async (...args) => {
+        const client = await origConnect(...args);
+        const origQuery = client.query.bind(client);
+        let backup = null;
+        client.query = async (text, params) => {
+          const t = typeof text === 'string' ? text.trim().toUpperCase() : '';
+          if (t === 'BEGIN') backup = mem.backup();
+          else if (t === 'ROLLBACK') {
+            if (backup) { backup.restore(); backup = null; }
+            return { rows: [], rowCount: 0, command: 'ROLLBACK' };
+          } else if (t === 'COMMIT') backup = null;
+          return origQuery(text, params);
+        };
+        return client;
+      };
+      try {
+        rr = await call('POST', '/api/maintenance/rebuild-usage', { exhibitIds: [exR1, exR2] }, 'c');
+        assert(rr.status === 400 && typeof rr.body.error === 'string'
+          && rr.body.error.includes(`#${exR2}`),
+          `任一展品失败返回明确错误（含展品编号）：${rr.status} ${JSON.stringify(rr.body)}`);
+
+        // 原子性：展品一的派生占用与预警最近状态保持操作前（被删/被改）的值，未被部分重建
+        assert((await usageOf(exR1)).length === 0,
+          '失败后展品一派生占用保持操作前值（未部分重建）');
+        const th1 = await thresholdOf(exR1);
+        assert(th1.length === 1 && Number(th1[0].last_used_lxh) === 0 && th1[0].last_level === 'none',
+          `失败后展品一预警最近状态保持操作前值：${JSON.stringify(th1)}`);
+        // 展品二的派生占用也未被改动（其失败随同事务一并回滚）
+        const r2UsageAfter = await usageOf(exR2);
+        assert(JSON.stringify(r2UsageAfter.map((r) => [r.year, Number(r.used_lxh)]))
+            === JSON.stringify(r2UsageBefore.map((r) => [r.year, Number(r.used_lxh)])),
+          '失败后展品二派生占用保持不变');
+        assert((await alertCount()) === alertsBefore, '失败不补发预警事件');
+      } finally {
+        dbModule.pool.connect = origConnect;
+      }
+
+      // 排除故障后重试：同一请求幂等成功，两件展品一并重建并同步预警基线（不补发事件）
+      await dbModule.pool.query(
+        `DELETE FROM plans WHERE exhibit_id = $1 AND title = '损坏计划'`, [exR2]);
+      rr = await call('POST', '/api/maintenance/rebuild-usage', { exhibitIds: [exR1, exR2] }, 'c');
+      assert(rr.status === 200 && rr.body.ok && rr.body.exhibitCount === 2
+        && typeof rr.body.yearCount === 'number'
+        && Array.isArray(rr.body.exhibits) && rr.body.exhibits.length === 2
+        && rr.body.exhibits.every((e) => Number.isInteger(e.exhibitId)
+          && Number.isInteger(e.yearCount) && Array.isArray(e.years)),
+        `修复后重试成功且成功响应字段保持兼容：${JSON.stringify(rr.body).slice(0, 200)}`);
+      const r1Usage = await usageOf(exR1);
+      assert(r1Usage.some((r) => r.year === 2033 && Number(r.used_lxh) === 800),
+        '重试后展品一 2033 派生占用恢复为 800');
+      const th1After = await thresholdOf(exR1);
+      assert(th1After.length === 1 && Number(th1After[0].last_used_lxh) === 800
+        && th1After[0].last_level === 'low',
+        `重试后展品一预警最近状态同步为最新占用（800/5000=16% → low）：${JSON.stringify(th1After)}`);
+      assert((await alertCount()) === alertsBefore, '重建只同步预警基线，不补发事件');
+    }
   }
 
   // =======================================================================
