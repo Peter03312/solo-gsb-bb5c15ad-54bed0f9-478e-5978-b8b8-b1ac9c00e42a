@@ -14,7 +14,9 @@
  *   - 单次变更只读取受影响年份区间内的历史记录，不扫描无关年份的全部历史。
  *
  * 派生结果（annual_usage）可由 scripts/rebuild-usage.js 对既有数据全量重建：
- * 重建按展品逐个在事务内进行，任何错误都会抛出并回滚，绝不留下新旧占用混杂的状态。
+ * 一次选中的多件展品在同一个“按展品 id 升序加键锁/行锁”的事务内重建，
+ * 任一展品或任一年份失败，全部选中展品的派生占用与预警最近状态随事务整体回滚
+ * （保持操作前值），绝不留下部分展品已改、部分未改或新旧占用混杂的状态。
  */
 
 const { computeOccupancy, yearsToRanges } = require('./service');
@@ -244,11 +246,35 @@ async function rebuildExhibitUsage(client, exhibitId) {
   return { exhibitId, years };
 }
 
+/**
+ * 一次操作原子重建多件展品的派生占用（须在调用方已开启的同一事务内调用，
+ * 且调用方已按展品 id 升序取得各展品键锁——HTTP/CLI 入口用 withExhibitsTransaction）：
+ *   - 全部选中展品在同一事务内逐个（仍按 id 升序）执行 rebuildExhibitUsage，
+ *     重建本身不补发任何预警事件，只同步各阈值行的最近占用/级别基线；
+ *   - 任一展品不存在、任一年份重算不一致或其他步骤失败即抛错，
+ *     由调用方唯一事务回滚——所有选中展品（含已处理完的先前展品）的
+ *     annual_usage 与 annual_quota_thresholds 最近状态都保持操作前值；
+ *   - 按 id 升序处理，与日常单展品/多展品占用变更的加锁顺序一致，不会循环等待，
+ *     且同展品的日常占用变更经同一键锁与本重建串行，不会并发写入互相覆盖。
+ * 返回 [{ exhibitId, years }]（与入参 ids 顺序相同）。
+ */
+async function rebuildExhibitsUsage(client, exhibitIds) {
+  const ids = [...new Set((exhibitIds || []).map(Number))]
+    .filter((id) => Number.isInteger(id) && id > 0)
+    .sort((a, b) => a - b);
+  const results = [];
+  for (const exhibitId of ids) {
+    results.push(await rebuildExhibitUsage(client, exhibitId));
+  }
+  return results;
+}
+
 module.exports = {
   yearsToRanges,
   refreshUsageYears,
   recomputeExhibitUsage,
   rebuildExhibitUsage,
+  rebuildExhibitsUsage,
   getUsageRow,
   getUsageRows,
   yearsForRebuild,

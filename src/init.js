@@ -3,11 +3,11 @@
 const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
-const { pool, withTransaction } = require('./db');
+const { pool, withExhibitsTransaction } = require('./db');
 const config = require('./config');
 const { buildWindows, doseByYear, yearMapToObject } = require('./dosing');
 const { parsePeriods } = require('./validation');
-const { rebuildExhibitUsage } = require('./usage');
+const { rebuildExhibitsUsage } = require('./usage');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -94,8 +94,9 @@ async function ensureDemo(conservatorId) {
  * 启动时补齐派生占用表 annual_usage：
  *  - 全新空库：无展品，直接跳过；
  *  - 全新带演示数据 / 从旧版本升级（annual_usage 尚无行但已有展品/上限/计划等源数据）：
- *    逐展品在事务内按统一剂量口径全量重建一次，任一年份不一致即抛错中止启动，
- *    绝不带着新旧占用混杂的派生结果对外服务。
+ *    全部展品在“按展品 id 升序键锁 + 行锁 + 单一事务”内按统一剂量口径原子重建一次，
+ *    任一展品或任一年份不一致即抛错中止启动，全部展品的派生占用与预警最近状态随事务回滚，
+ *    绝不带着部分展品已改或新旧占用混杂的派生结果对外服务。
  * 已在运行中维护的库（annual_usage 非空）不在启动时重复扫描全部历史。
  */
 async function backfillDerivedUsage() {
@@ -104,11 +105,12 @@ async function backfillDerivedUsage() {
   const { rows: exhibitRows } = await pool.query('SELECT id FROM exhibits ORDER BY id');
   if (exhibitRows.length === 0) return;
 
-  console.log(`[init] annual_usage 为空，开始从既有数据重建 ${exhibitRows.length} 件展品的年度占用…`);
-  for (const r of exhibitRows) {
-    const exhibitId = Number(r.id);
-    await withTransaction((client) => rebuildExhibitUsage(client, exhibitId));
-  }
+  const exhibitIds = exhibitRows.map((r) => Number(r.id));
+  console.log(`[init] annual_usage 为空，开始从既有数据重建 ${exhibitIds.length} 件展品的年度占用…`);
+  // 全部展品同一事务原子生效：任一展品/年份失败则整体回滚（保持空表）并中止启动，
+  // 不会出现部分展品已补齐、其余展品仍缺失的状态；与同展品日常占用变更按展品键锁串行。
+  await withExhibitsTransaction(exhibitIds, (client) =>
+    rebuildExhibitsUsage(client, exhibitIds));
   console.log('[init] annual_usage 重建完成');
 }
 

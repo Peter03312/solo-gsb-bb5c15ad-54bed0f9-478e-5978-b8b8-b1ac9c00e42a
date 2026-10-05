@@ -3,15 +3,19 @@
 /*
  * 维护接口（仅保管员）：
  *   POST /api/maintenance/rebuild-usage  全量重建年度占用派生表 annual_usage。
- * 重建按展品逐个在“展品键锁 + 行锁 + 事务”内进行：先删旧派生行，再用线上同一统一剂量口径
- * 逐年写回；任一展品失败整体回滚并返回错误，绝不留下新旧占用混杂的结果。
- * body 可选 { exhibitIds: [..] } 只重建指定展品；不传则重建全部展品。
+ * 一次操作选中的全部展品在“按展品 id 升序键锁 + 行锁 + 单一事务”内完成：
+ * 先删各展品旧派生行，再用线上同一统一剂量口径逐年写回，并同步预警阈值最近状态
+ * （不补发任何预警事件）。任一展品或任一年份失败，单一事务整体回滚——
+ * 所有选中展品（含先前已处理展品）的 annual_usage 与预警最近状态均保持操作前值，
+ * 返回 { error } 说明失败原因，绝不留下部分展品已改/新旧占用混杂的结果。
+ * 与同展品日常占用变更经同一展品键锁串行，不会并发写入互相覆盖。
+ * body 可选 { exhibitIds: [..] } 只重建指定展品；不传（或 {}）则重建全部展品。
  */
 
 const express = require('express');
-const { query, withKeyLock, withTransaction } = require('../db');
+const { query, withExhibitsTransaction } = require('../db');
 const { requireRole, requireAuth } = require('../auth');
-const { rebuildExhibitUsage } = require('../usage');
+const { rebuildExhibitsUsage } = require('../usage');
 
 const router = express.Router();
 
@@ -24,6 +28,9 @@ router.post('/rebuild-usage', requireRole('conservator'), async (req, res, next)
       exhibitIds = req.body.exhibitIds.map(Number);
       if (exhibitIds.some((id) => !Number.isInteger(id) || id <= 0)) {
         return res.status(400).json({ error: 'exhibitIds 必须为正整数数组' });
+      }
+      if (exhibitIds.length === 0) {
+        return res.status(400).json({ error: 'exhibitIds 至少包含一件展品' });
       }
     }
 
@@ -42,14 +49,10 @@ router.post('/rebuild-usage', requireRole('conservator'), async (req, res, next)
       ids = (await query('SELECT id FROM exhibits ORDER BY id')).rows.map((r) => Number(r.id));
     }
 
-    const rebuilt = [];
-    // 逐展品加展品键锁 + 事务（与既有业务事务互斥），任一失败即整体报错回滚。
-    for (const exhibitId of ids) {
-      const result = await withKeyLock(`exhibit:${exhibitId}`, () =>
-        withTransaction((client) => rebuildExhibitUsage(client, exhibitId))
-      );
-      rebuilt.push(result);
-    }
+    // 全部选中展品在同一个事务（按 id 升序键锁 + 行锁）内原子重建：
+    // 任一展品/年份失败则整体回滚，已处理展品的派生占用与预警基线也一并还原。
+    const rebuilt = await withExhibitsTransaction(ids, (client) =>
+      rebuildExhibitsUsage(client, ids));
 
     res.json({
       ok: true,

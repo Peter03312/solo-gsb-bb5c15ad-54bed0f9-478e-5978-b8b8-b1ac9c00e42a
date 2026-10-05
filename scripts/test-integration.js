@@ -3599,6 +3599,8 @@ async function runFlow() {
     // 指定展品 + 未知展品 400
     rr = await call('POST', '/api/maintenance/rebuild-usage', { exhibitIds: [999999] }, 'c');
     assert(rr.status === 400, '重建未知展品返回 400');
+    rr = await call('POST', '/api/maintenance/rebuild-usage', { exhibitIds: [] }, 'c');
+    assert(rr.status === 400, '空展品数组返回 400');
     rr = await call('POST', '/api/maintenance/rebuild-usage', { exhibitIds: [exU] }, 'c');
     assert(rr.status === 200 && rr.body.exhibitCount === 1, '按展品重建');
   }
@@ -3796,6 +3798,115 @@ async function runFlow() {
       && batchMeasSrc.some((s) => s.lux === 60 && s.yearly['2034'] === 180)
       && batchMeasSrc.some((s) => s.lux === 180 && s.yearly['2034'] === 540),
       '批次生成的两条相接实测在占用来源中各自独立');
+  }
+
+  // =======================================================================
+  // 年度占用重建的多展品原子性：HTTP 维护接口与“命令行/启动补齐”同一路径，
+  // 一次操作选中多件展品时，任一展品（先前展品已重建完）失败：
+  // 所有选中展品的 annual_usage 与预警阈值最近状态整体回滚到操作前值，
+  // 返回/记录明确错误，且不补发任何预警事件；修正后重跑幂等成功。
+  // =======================================================================
+  {
+    const usageModule = require('../src/usage');
+    const svc = require('../src/service');
+    let rr;
+
+    const exRB1 = await createExhibit('重建原子展品一');
+    const exRB2 = await createExhibit('重建原子展品二');
+    for (const exId of [exRB1, exRB2]) {
+      await call('POST', `/api/exhibits/${exId}/limits`, { year: 2035, limitLxh: 50000 }, 'c');
+      await call('POST', `/api/exhibits/${exId}/quota-thresholds`,
+        { year: 2035, lowPct: 10, highPct: 80 }, 'c');
+    }
+    const pRB = await submitPlan(exRB1, '重建原子计划', '2035-03-01', '2035-03-01',
+      ['09:00-17:00'], 100); // 800
+    await approvePlan(pRB);
+    // exRB1 有占用 800；exRB2 无占用（0）
+
+    const qAll = async (sql, params = []) => (await dbModule.pool.query(sql, params)).rows;
+    const rbPh = `$1, $2`;
+    const snapshot = async () => ({
+      usage: JSON.stringify(
+        (await qAll(
+          'SELECT exhibit_id, year, used_lxh, confirmed_lxh, incident_lxh, shared_lxh, residue_lxh '
+          + `FROM annual_usage WHERE exhibit_id IN (${rbPh}) ORDER BY exhibit_id, year`,
+          [exRB1, exRB2]
+        )).map((r) => ({ ...r,
+          used_lxh: Number(r.used_lxh), confirmed_lxh: Number(r.confirmed_lxh),
+          incident_lxh: Number(r.incident_lxh), shared_lxh: Number(r.shared_lxh),
+          residue_lxh: Number(r.residue_lxh) }))
+      ),
+      thresholds: JSON.stringify(
+        (await qAll(
+          'SELECT exhibit_id, year, last_used_lxh, last_level FROM annual_quota_thresholds '
+          + `WHERE exhibit_id IN (${rbPh}) ORDER BY exhibit_id, year`,
+          [exRB1, exRB2]
+        )).map((r) => ({ ...r, last_used_lxh: Number(r.last_used_lxh) }))
+      ),
+      alerts: Number((await qAll(
+        `SELECT COUNT(*)::int AS n FROM annual_quota_alerts WHERE exhibit_id IN (${rbPh})`,
+        [exRB1, exRB2]
+      ))[0].n),
+    });
+    const before = await snapshot();
+    assert(JSON.parse(before.usage).some((r) => Number(r.exhibit_id) === exRB1
+      && Number(r.used_lxh) === 800), '重建前展品一占用为 800');
+
+    // 注入故障：重算第二件展品（id 升序在后）时抛错；先前展品的删除/写回必须随事务回滚。
+    const origCompute = svc.computeOccupancy;
+    svc.computeOccupancy = async function patchedCompute(client, exhibitId, opts) {
+      if (Number(exhibitId) === exRB2) {
+        throw new Error('注入故障：展品二重算失败（模拟年份不一致）');
+      }
+      return origCompute.call(this, client, exhibitId, opts);
+    };
+    try {
+      // HTTP：整组回滚 + 明确错误（500 统一错误形态）
+      rr = await call('POST', '/api/maintenance/rebuild-usage',
+        { exhibitIds: [exRB1, exRB2] }, 'c');
+      assert(rr.status === 500 && /注入故障/.test(rr.body && rr.body.error),
+        `后续展品失败时 HTTP 整体报错：${rr.status} ${JSON.stringify(rr.body).slice(0, 200)}`);
+
+      const afterHttp = await snapshot();
+      assert(afterHttp.usage === before.usage, 'HTTP 失败后两展品 annual_usage 均为操作前值（先前展品不残留新值）');
+      assert(afterHttp.thresholds === before.thresholds, 'HTTP 失败后两展品预警最近状态均为操作前值');
+      assert(afterHttp.alerts === before.alerts, 'HTTP 失败不补发预警事件');
+
+      // 命令行/启动补齐同一路径（rebuildExhibitsUsage 单事务）：同样整组回滚并抛出明确错误
+      let cliErr = null;
+      try {
+        await dbModule.withExhibitsTransaction([exRB1, exRB2], (client) =>
+          usageModule.rebuildExhibitsUsage(client, [exRB2, exRB1]));
+      } catch (err) {
+        cliErr = err;
+      }
+      assert(cliErr && /注入故障/.test(cliErr.message), '命令行路径失败抛出明确错误');
+      const afterCli = await snapshot();
+      assert(afterCli.usage === before.usage && afterCli.thresholds === before.thresholds,
+        '命令行路径失败后全部选中展品派生占用与预警基线保持操作前值');
+      assert(afterCli.alerts === before.alerts, '命令行路径失败不补发预警事件');
+    } finally {
+      svc.computeOccupancy = origCompute;
+    }
+
+    // 故障消除后原操作重试：整组成功，幂等且数值与统一口径一致
+    rr = await call('POST', '/api/maintenance/rebuild-usage',
+      { exhibitIds: [exRB1, exRB2] }, 'c');
+    assert(rr.status === 200 && rr.body.ok && rr.body.exhibitCount === 2,
+      `失败后重试整组成功：${rr.status} ${JSON.stringify(rr.body).slice(0, 200)}`);
+    const detail1 = await call('GET', `/api/exhibits/${exRB1}`, null, 'i');
+    const detail2 = await call('GET', `/api/exhibits/${exRB2}`, null, 'i');
+    assert(detail1.body.years['2035'].used === 800 && detail2.body.years['2035'].used === 0,
+      '重试后两展品占用与当前统一口径一致（800 / 0）');
+    const afterOk = await snapshot();
+    assert(afterOk.alerts === before.alerts, '重建成功同样不补发预警事件（只同步基线）');
+
+    // 再次重试结果一致（幂等）
+    rr = await call('POST', '/api/maintenance/rebuild-usage', { exhibitIds: [exRB1, exRB2] }, 'c');
+    assert(rr.status === 200, '重复重建幂等成功');
+    const afterRetry = await snapshot();
+    assert(afterRetry.usage === afterOk.usage && afterRetry.thresholds === afterOk.thresholds,
+      '重复重建结果稳定');
   }
 }
 
